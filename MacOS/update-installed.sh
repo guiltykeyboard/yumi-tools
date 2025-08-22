@@ -2,13 +2,12 @@
 # update-installed.sh
 # Keeps /Volumes/<SelectedVolume>/YUMI/Installed.txt in sync with on-disk *.iso files.
 # - Volume picker (list + manual path)
-# - Dry-run first with unified diff
-# - Colorized diff (toggle) + legend
+# - Dry-run first with unified diff + color toggle + legend
 # - Interactive menu: Write / View / Rescan / Quit
-# - Only *.iso (not *.iso.zip); skips macOS system dirs under YUMI
+# - Only *.iso (excludes *.iso.zip); skips macOS system dirs under YUMI
 # - Outputs relative backslash paths; groups by top-level folder in disk order
 # - Case-sensitive sorting within each group
-# - No manual temp files (uses process substitution)
+# - No manual temp files (uses process substitution only for diff; write verification avoids it)
 
 set -euo pipefail
 
@@ -46,13 +45,12 @@ choose_volume() {
         ;;
       [Mm])
         read -r -p "Enter volume path (e.g., /Volumes/Potato): " manual
-        # Normalize case/format: allow '/volumes/...'
         case "$manual" in
           /volumes/*) manual="/Volumes/${manual#/volumes/}";;
           /Volumes/*) ;;
           *) echo "Please enter a path under /Volumes (e.g., /Volumes/Potato)."; continue;;
         esac
-        manual="${manual%/}"   # trim trailing slash
+        manual="${manual%/}"
         if [[ ! -d "$manual" ]]; then
           echo "Volume path not found: $manual"
           continue
@@ -155,8 +153,8 @@ build_proposed() {
   PROPOSED=""
   local groups=()
 
-  # ROOT first if any *.iso at BASE
-  if find "$BASE" -maxdepth 1 -type f -iname "*.iso" -print -quit >/dev/null 2>&1; then
+  # ROOT first if any *.iso at BASE (no recursion in ROOT)
+  if find "$BASE" -maxdepth 1 -type f \( -iname "*.iso" -a ! -iname "*.iso.zip" \) -print -quit >/dev/null 2>&1; then
     groups+=("ROOT")
   fi
 
@@ -174,11 +172,12 @@ build_proposed() {
   local grp lines
   for grp in "${groups[@]}"; do
     if [[ "$grp" == "ROOT" ]]; then
-      lines="$(find "$BASE" -maxdepth 1 -type f -iname "*.iso" -print0 \
+      lines="$(find "$BASE" -maxdepth 1 -type f \( -iname "*.iso" -a ! -iname "*.iso.zip" \) -print0 \
         | xargs -0 -I{} bash -c 'f="$1"; rel="${f#'"$BASE"'/}"; printf "%s\n" "${rel//\//\\}"' _ {})"
     else
       if [[ -d "$BASE/$grp" ]]; then
-        lines="$(find "$BASE/$grp" -type f -iname "*.iso" -print0 \
+        # Recurse into all subfolders for non-ROOT groups
+        lines="$(find "$BASE/$grp" -type f \( -iname "*.iso" -a ! -iname "*.iso.zip" \) -print0 \
           | xargs -0 -I{} bash -c 'f="$1"; rel="${f#'"$BASE"'/}"; printf "%s\n" "${rel//\//\\}"' _ {})"
       else
         lines=""
@@ -207,6 +206,7 @@ show_diff() {
   echo
   echo "Proposed changes to Installed.txt:"
   if command -v diff >/dev/null 2>&1; then
+    # process substitution is fine under bash; colorization handled downstream
     diff -u -L "Installed.txt (current)" -L "Installed.txt (proposed)" \
       <(printf "%s\n" "$current") <(printf "%s\n" "$proposed") \
       | colorize_diff || true
@@ -217,9 +217,45 @@ show_diff() {
 }
 
 write_changes() {
-  cp -f "$LIST" "$LIST.bak.$(date +%Y%m%d-%H%M%S)" || true
-  printf "%s\n" "$PROPOSED" > "$LIST"
-  echo "Changes written. Backup saved alongside Installed.txt."
+  # Ensure target dir is writable
+  if [[ ! -w "$BASE" ]]; then
+    echo "Error: Directory not writable: $BASE"
+    ls -ldO "$BASE" 2>/dev/null || ls -ld "$BASE" || true
+    return 1
+  fi
+
+  # If the file exists but is not writable, report and show flags
+  if [[ -e "$LIST" && ! -w "$LIST" ]]; then
+    echo "Error: File not writable: $LIST"
+    ls -lO "$LIST" 2>/dev/null || ls -l "$LIST" || true
+    echo "Tip: check volume permissions or file flags (e.g., 'uchg')."
+    return 1
+  fi
+
+  # Backup current file if present
+  if [[ -e "$LIST" ]]; then
+    cp -f "$LIST" "$LIST.bak.$(date +%Y%m%d-%H%M%S)" || true
+  fi
+
+  # Write proposed content exactly; ensure a trailing newline
+  if [[ -n "$PROPOSED" ]]; then
+    printf "%s\n" "$PROPOSED" > "$LIST"
+  else
+    : > "$LIST"
+  fi
+
+  # Flush to disk
+  sync || true
+
+  # Verify that write took effect (avoid process substitution for portability)
+  if printf "%s\n" "$PROPOSED" | cmp -s - "$LIST"; then
+    echo "Changes written to Installed.txt. Backup saved alongside Installed.txt."
+  else
+    echo "Warning: write verification failed; Installed.txt does not match proposed content."
+    echo "Inspect permissions/flags on the volume or file."
+    ls -lO "$LIST" 2>/dev/null || ls -l "$LIST" || true
+    return 1
+  fi
 }
 
 menu_loop() {
@@ -260,10 +296,13 @@ main() {
   choose_volume                 # sets BASE via list or manual
   normalize_list                # sets LIST and normalizes
   build_proposed                # in-memory build
-  if cmp -s <(cat "$LIST") <(printf "%s\n" "$PROPOSED"); then
+
+  # If no changes, report and exit (avoid process substitution)
+  if printf "%s\n" "$PROPOSED" | cmp -s - "$LIST"; then
     echo "No changes needed. Installed.txt is up to date."
     exit 0
   fi
+
   ask_color_choice              # ask before showing diff
   show_diff
   menu_loop
