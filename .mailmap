@@ -1,1 +1,9 @@
+## Mailmap
+
+The `.mailmap` file is used to unify contributor identities across the repository. It helps prevent duplicate contributor entries when different emails or usernames are used. In this repo, it ensures that old commits with the wrong noreply address are mapped to the current `guiltykeyboard` identity.
+
+Here is the line from the `.mailmap` file used for this purpose:
+
+```
 guiltykeyboard <15965363+guiltykeyboard@users.noreply.github.com> guiltykeyboard <123456+guiltykeyboard@users.noreply.github.com>
+```
