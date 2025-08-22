@@ -169,3 +169,13 @@ Enter choice:
 ```
 
 ---
+
+## Mailmap
+
+The `.mailmap` file is used to unify contributor identities and prevent duplicate entries when commits are made with different emails. It helps ensure that all commits from the same contributor are attributed consistently.
+
+In this repository, the `.mailmap` file maps an older GitHub noreply address to the current one so all commits appear under the same contributor:
+
+```plaintext
+guiltykeyboard <15965363+guiltykeyboard@users.noreply.github.com> guiltykeyboard <123456+guiltykeyboard@users.noreply.github.com>
+```
