@@ -1,6 +1,15 @@
 # yumi-tools
 Tools for YUMI
 
+This repository contains both a macOS (Bash) and Windows (PowerShell) version of the update-installed script. Both scripts behave the same, providing a way to keep an `Installed.txt` index of `.iso` files inside a `YUMI` folder on any mounted drive.
+
+> **Important:** The USB drive must be prepared by **YUMI exFAT** *before* running either script.
+>
+> ### Prerequisite setup
+> 1. **Download YUMI exFAT:** https://pendrivelinux.com/yumi-multiboot-usb-creator/
+> 2. **Format/prepare the drive with YUMI exFAT**, then create your desired **subfolder structure** under `YUMI` and copy your **.iso** files to the drive.
+> 3. **Run the script** (macOS or Windows) to scan the drive and update `Installed.txt` accordingly.
+
 # update-installed.sh
 
 A macOS Bash script to keep a `Installed.txt` index of all `.iso` files inside a `YUMI` folder on any mounted drive.
@@ -15,16 +24,26 @@ A macOS Bash script to keep a `Installed.txt` index of all `.iso` files inside a
 - **Interactive menu:** Use keys (W)rite changes, (V)iew current Installed.txt, (R)efresh diff, (Q)uit without changes.
 - **Smart file handling:** Processes only `.iso` files; skips macOS system directories like `.Trashes` and `.Spotlight-V100`; paths use relative backslashes; files are grouped by top-level folder; sorted case-sensitively; and listed in disk order.
 - **No manual temp files:** All operations are handled internally without creating temporary files on disk.
+- On Windows, the diff uses `git` for a unified diff when installed, otherwise falls back to a clear add/remove view.
 
 ---
 
 ## ⚡ Quick Install
 
-Run this in your terminal to download the script and make it executable:
+### macOS
+
+Run this in your terminal to download the script, make it executable, and run it:
 
 ```bash
-curl -L -o update-installed.sh https://raw.githubusercontent.com/guiltykeyboard/yumi-tools/main/MacOS/update-installed.sh
-chmod +x update-installed.sh
+curl -L -o update-installed.sh https://raw.githubusercontent.com/guiltykeyboard/yumi-tools/main/MacOS/update-installed.sh && chmod +x update-installed.sh && ./update-installed.sh
+```
+
+### Windows
+
+Run this in PowerShell to download and execute the script:
+
+```powershell
+PowerShell -NoProfile -ExecutionPolicy Bypass -Command "Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/guiltykeyboard/yumi-tools/main/Windows/update-installed.ps1' -OutFile 'update-installed.ps1'; & '.\update-installed.ps1'"
 ```
 
 ---
