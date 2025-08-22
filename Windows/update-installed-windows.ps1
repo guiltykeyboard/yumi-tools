@@ -1,275 +1,263 @@
-#!/usr/bin/env bash
-# update-installed-linux.sh
-# Keeps <MountBase>/<SelectedVolume>/YUMI/Installed.txt in sync with on-disk *.iso files.
-# - Volume picker (list + manual path) from common Linux mount roots (/media, /run/media/$USER)
-# - Dry-run first with unified diff + color toggle + legend
-# - Interactive menu: Write / View / Rescan / Quit
-# - Only *.iso (excludes *.iso.zip); skips typical Linux system dirs under YUMI (none by default)
-# - Outputs relative backslash paths; groups by top-level folder in disk order
-# - Case-sensitive sorting within each group
-# - No manual temp files (uses process substitution only for diff; write verification avoids it)
+#requires -Version 5.1
+<#!
+  update-installed-windows.ps1
+  Keeps <Drive>:\YUMI\Installed.txt in sync with on-disk *.iso files.
+  - Drive picker (letter list) + manual path
+  - Dry-run first with diff + color toggle + legend
+  - Optional unified diff via Git for Windows (if available), else clear add/remove view
+  - Interactive menu: [W]rite / [V]iew / [R]escan / [Q]uit
+  - Only *.iso (excludes *.iso.zip)
+  - Relative backslash paths; grouped by top-level folder (disk enumeration order)
+  - Case-sensitive sorting within each group
+  - Timestamped backup and write verification
+!#>
 
-set -euo pipefail
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
-# ---------------- Settings ----------------
-# Candidate mount roots; order matters
-MOUNT_ROOTS=("/media" "/run/media/${USER:-$(id -un)}")
-
-# ---------------- Volume selection (with Manual Path) ----------------
-
-choose_volume() {
-  local candidates=()
-  # Collect first-level directories under mount roots
-  for root in "${MOUNT_ROOTS[@]}"; do
-    [[ -d "$root" ]] || continue
-    while IFS= read -r -d '' d; do
-      # Save as root:path  (we'll render nicely later)
-      candidates+=("$root:${d#$root/}")
-    done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -not -name ".*" -print0)
-  done
-
-  if [[ ${#candidates[@]} -eq 0 ]]; then
-    echo "No user volumes found under: ${MOUNT_ROOTS[*]}"
-    echo "You can still choose Manual Path."
-  fi
-
-  while true; do
-    echo
-    echo "Select a volume:"
-    local i=1
-    for entry in "${candidates[@]}"; do
-      local root path label base
-      root=${entry%%:*}
-      path=${entry#*:}
-      base="$root/$path/YUMI"
-      if [[ -d "$base" ]]; then
-        label="$root/$path (YUMI found)"
-      else
-        label="$root/$path"
-      fi
-      printf "  %2d) %s\n" "$i" "$label"
-      i=$((i+1))
-    done
-    echo "   M) Manual path (e.g., /media/username/MyUSB)"
-    echo "   Q) Quit"
-    read -r -p "Enter choice: " ans
-
-    case "$ans" in
-      [Qq]) echo "Aborted."; exit 0 ;;
-      [Mm])
-        read -r -p "Enter mounted volume path (e.g., /media/$USER/MyUSB): " manual
-        manual=${manual%/}
-        if [[ ! -d "$manual" ]]; then
-          echo "Volume path not found: $manual"; continue
-        fi
-        BASE="$manual/YUMI"
-        if [[ -d "$BASE" ]]; then
-          echo "Using BASE: $BASE"; return 0
-        else
-          echo "Folder not found: $BASE"
-          echo "Tip: ensure the selected volume contains a 'YUMI' folder."
-          continue
-        fi
-        ;;
-      *)
-        if [[ "$ans" =~ ^[0-9]+$ ]] && (( ans>=1 && ans<=${#candidates[@]} )); then
-          local sel=${candidates[$((ans-1))]}
-          local root=${sel%%:*}
-          local path=${sel#*:}
-          BASE="$root/$path/YUMI"
-          if [[ -d "$BASE" ]]; then
-            echo "Using BASE: $BASE"; return 0
-          else
-            echo "Folder not found: $BASE"; echo "Tip: ensure the selected volume contains a 'YUMI' folder."
-          fi
-        else
-          echo "Invalid choice."
-        fi
-        ;;
-    esac
-  done
+# ----------------------------- Color / Legend -----------------------------
+$global:UseColor = $false
+function Test-ColorDefault {
+    try {
+        if ($Host.Name -like '*ConsoleHost*' -or $env:WT_SESSION -or $PSStyle) { return $true }
+    } catch {}
+    return $false
 }
 
-# ---------------- Color / Legend ----------------
-COLORIZE=0
-bold=$'\033[1m'; red=$'\033[31m'; green=$'\033[32m'; cyan=$'\033[36m'; reset=$'\033[0m'
-
-ask_color_choice() {
-  local default_yes=0
-  if [ -t 1 ]; then default_yes=1; fi
-  echo
-  if (( default_yes )); then
-    read -r -p "Show colorized diff? [Y/n]: " resp
-    case "$resp" in [Nn]*) COLORIZE=0 ;; *) COLORIZE=1 ;; esac
-  else
-    read -r -p "Show colorized diff? (output is being piped) [y/N]: " resp
-    case "$resp" in [Yy]*) COLORIZE=1 ;; *) COLORIZE=0 ;; esac
-  fi
+function Read-ColorPreference {
+    $defaultYes = Test-ColorDefault
+    if ($defaultYes) {
+        $resp = Read-Host 'Show colorized diff? [Y/n]'
+        if ($resp -match '^[Nn]') { $global:UseColor = $false } else { $global:UseColor = $true }
+    } else {
+        $resp = Read-Host 'Show colorized diff? (output may be redirected) [y/N]'
+        if ($resp -match '^[Yy]') { $global:UseColor = $true } else { $global:UseColor = $false }
+    }
 }
 
-print_legend() {
-  echo
-  if (( COLORIZE )); then
-    echo "${bold}Legend:${reset}  ${red}- deletion${reset}   ${green}+ addition${reset}   ${cyan}@@ hunk@@${reset}   ${bold}---/+++ labels${reset}"
-  else
-    echo "Legend:  - deletion   + addition   @@ hunk@@   ---/+++ labels"
-  fi
+function Write-Legend {
+    Write-Host ''
+    if ($global:UseColor) {
+        Write-Host ('Legend:  ') -NoNewline
+        Write-Host ('- deletion') -ForegroundColor Red -NoNewline
+        Write-Host ('   ') -NoNewline
+        Write-Host ('+ addition') -ForegroundColor Green
+    } else {
+        Write-Host 'Legend:  - deletion   + addition'
+    }
 }
 
-colorize_diff() {
-  if (( COLORIZE )); then
-    awk -v red="$red" -v green="$green" -v cyan="$cyan" -v bold="$bold" -v reset="$reset" '
-      /^--- /  {print bold $0 reset; next}
-      /^\+\+\+/{print bold $0 reset; next}
-      /^@@/    {print cyan $0 reset; next}
-      /^\+/    {print green $0 reset; next}
-      /^-/     {print red   $0 reset; next}
-               {print $0}
-    '
-  else
-    cat
-  fi
+function Write-DiffLine {
+    param([string]$Line)
+    if (-not $global:UseColor) { Write-Host $Line; return }
+    if ($Line.StartsWith('+')) { Write-Host $Line -ForegroundColor Green; return }
+    if ($Line.StartsWith('-')) { Write-Host $Line -ForegroundColor Red;   return }
+    Write-Host $Line
 }
 
-# ---------------- Core logic ----------------
-LIST=""
-PROPOSED=""
+# ----------------------------- Drive selection ----------------------------
+function Select-Drive {
+    $drives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Root -match '^[A-Z]:\\$' } | Sort-Object Name
+    if (-not $drives) { throw 'No filesystem drives found.' }
 
-normalize_list() {
-  LIST="$BASE/Installed.txt"
-  mkdir -p "$BASE"
-  : > "$LIST"  # ensure file exists (Linux sed -i works without backup suffix)
-  # Strip CR characters if any (in case file was edited on Windows)
-  sed -i $'s/\r$//' "$LIST" || true
+    Write-Host 'Select a drive:'
+    $index = 1
+    foreach ($d in $drives) {
+        $hasY = Test-Path (Join-Path $d.Root 'YUMI')
+        $label = if ($hasY) { "{0} (YUMI found)" -f $d.Root } else { $d.Root }
+        Write-Host ("  {0,2}) {1}" -f $index, $label)
+        $index++
+    }
+    Write-Host '   M) Manual path (e.g., E:\)'
+    Write-Host '   Q) Quit'
+
+    while ($true) {
+        $ans = Read-Host 'Enter choice'
+        switch -Regex ($ans) {
+            '^[Qq]$' { throw 'Aborted by user.' }
+            '^[Mm]$' {
+                $manual = Read-Host 'Enter drive root (e.g., E:\ or E:)'
+                if ($manual -match '^[A-Za-z]:$') { $manual += '\\' }
+                if ($manual -notmatch '^[A-Za-z]:\\$') { Write-Host 'Please enter like E:\'; continue }
+                $base = Join-Path $manual 'YUMI'
+                if (Test-Path $base) { return $base } else { Write-Host "Folder not found: $base"; continue }
+            }
+            '^[0-9]+$' {
+                $i = [int]$ans
+                if ($i -lt 1 -or $i -gt $drives.Count) { Write-Host 'Invalid choice.'; continue }
+                $root = $drives[$i-1].Root
+                $base = Join-Path $root 'YUMI'
+                if (Test-Path $base) { return $base } else { Write-Host "Folder not found: $base" }
+            }
+            default { Write-Host 'Invalid choice.' }
+        }
+    }
 }
 
-# Build $PROPOSED from disk; groups from disk order; case-sensitive sort per group
-build_proposed() {
-  PROPOSED=""
-  local groups=()
+# ----------------------------- Core helpers --------------------------------
+$script:BASE = $null
+$script:LIST = $null
+$script:PROPOSED = $null
 
-  # ROOT first if any *.iso at BASE (no recursion in ROOT)
-  if find "$BASE" -maxdepth 1 -type f \( -iname "*.iso" -a ! -iname "*.iso.zip" \) -print -quit >/dev/null 2>&1; then
-    groups+=("ROOT")
-  fi
-
-  # Top-level dirs inside BASE in disk traversal order
-  while IFS= read -r -d '' d; do
-    groups+=("${d#$BASE/}")
-  done < <(find "$BASE" -mindepth 1 -maxdepth 1 -type d -not -name ".*" -print0)
-
-  local grp lines
-  for grp in "${groups[@]}"; do
-    if [[ "$grp" == "ROOT" ]]; then
-      lines="$(find "$BASE" -maxdepth 1 -type f \( -iname "*.iso" -a ! -iname "*.iso.zip" \) -print0 \
-        | xargs -0 -I{} bash -c 'f="$1"; rel="${f#'"$BASE"'/}"; printf "%s\n" "${rel//\//\\}"' _ {})"
-    else
-      if [[ -d "$BASE/$grp" ]]; then
-        lines="$(find "$BASE/$grp" -type f \( -iname "*.iso" -a ! -iname "*.iso.zip" \) -print0 \
-          | xargs -0 -I{} bash -c 'f="$1"; rel="${f#'"$BASE"'/}"; printf "%s\n" "${rel//\//\\}"' _ {})"
-      else
-        lines=""
-      fi
-    fi
-
-    if [[ -n "${lines//$'\n' /}" ]]; then
-      lines="$(printf "%s\n" "$lines" | LC_ALL=C sort -u)"
-      PROPOSED+="$lines"$'\n\n'
-    fi
-  done
-
-  # Trim trailing blanks & normalize single blank between groups
-  if [[ -n "$PROPOSED" ]]; then
-    PROPOSED="$(printf "%s" "$PROPOSED" | awk 'NF{last=NR} {print} END{for(i=NR;i>last;i--) ;}')"
-    PROPOSED="$(printf "%s\n" "$PROPOSED" | awk 'NF{print; blank=0; next} {if(!blank){print ""} blank=1}')"
-  fi
+function Set-ListFile {
+    $script:LIST = Join-Path $script:BASE 'Installed.txt'
+    if (-not (Test-Path $script:BASE)) { New-Item -ItemType Directory -Path $script:BASE -Force | Out-Null }
+    if (-not (Test-Path $script:LIST)) { New-Item -ItemType File -Path $script:LIST -Force | Out-Null }
 }
 
-show_diff() {
-  local current proposed
-  current="$(cat "$LIST")"
-  proposed="$PROPOSED"
-  print_legend
-  echo
-  echo "Proposed changes to Installed.txt:"
-  if command -v diff >/dev/null 2>&1; then
-    diff -u -L "Installed.txt (current)" -L "Installed.txt (proposed)" \
-      <(printf "%s\n" "$current") <(printf "%s\n" "$proposed") \
-      | colorize_diff || true
-  else
-    echo "(diff not found; showing proposed file)"; printf "%s\n" "$proposed"
-  fi
+function Get-TopDirs {
+    $exclude = @('System Volume Information', '$RECYCLE.BIN', 'RECYCLER', 'Recovery', 'MSOCache', 'lost+found')
+    Get-ChildItem -LiteralPath $script:BASE -Directory -Force | Where-Object { $exclude -notcontains $_.Name }
 }
 
-write_changes() {
-  # Check writability
-  if [[ ! -w "$BASE" ]]; then
-    echo "Error: Directory not writable: $BASE"
-    ls -ld "$BASE" || true
-    return 1
-  fi
-  if [[ -e "$LIST" && ! -w "$LIST" ]]; then
-    echo "Error: File not writable: $LIST"
-    ls -l "$LIST" || true
-    return 1
-  fi
-
-  # Backup current file if present
-  if [[ -e "$LIST" ]]; then
-    cp -f "$LIST" "$LIST.bak.$(date +%Y%m%d-%H%M%S)" || true
-  fi
-
-  # Write proposed content; ensure trailing newline
-  if [[ -n "$PROPOSED" ]]; then
-    printf "%s\n" "$PROPOSED" > "$LIST"
-  else
-    : > "$LIST"
-  fi
-
-  sync || true
-
-  # Verify (avoid process substitution for portability)
-  if printf "%s\n" "$PROPOSED" | cmp -s - "$LIST"; then
-    echo "Changes written to Installed.txt. Backup saved alongside Installed.txt."
-  else
-    echo "Warning: write verification failed; Installed.txt does not match proposed content."
-    ls -l "$LIST" || true
-    return 1
-  fi
+function Convert-PathToRelativeBackslash {
+    param([string]$FullPath)
+    $baseWithSep = $script:BASE.TrimEnd('\\') + '\\'
+    if ($FullPath.StartsWith($baseWithSep, [System.StringComparison]::OrdinalIgnoreCase)) {
+        ($FullPath.Substring($baseWithSep.Length)) -replace '/', '\\'
+    } else {
+        $FullPath -replace '/', '\\'
+    }
 }
 
-menu_loop() {
-  while true; do
-    echo
-    echo "Select an option:"
-    echo "  [W] Write these changes to Installed.txt"
-    echo "  [V] View full proposed file"
-    echo "  [R] Rescan disk and re-run dry run"
-    echo "  [Q] Quit without writing"
-    read -r -p "Your choice (W/V/R/Q): " choice
-    case "$choice" in
-      [Ww]) write_changes; break ;;
-      [Vv]) echo "----- Proposed Installed.txt -----"; printf "%s\n" "$PROPOSED"; echo "----------------------------------" ;;
-      [Rr]) build_proposed; show_diff ;;
-      [Qq]) echo "Aborted. No changes written."; break ;;
-      *) echo "Unrecognized choice." ;;
-    esac
-  done
+# ----------------------------- Build proposed ------------------------------
+function Build-Proposed {
+    $linesAll = @()
+    $groups = @()
+
+    $rootIsos = Get-ChildItem -LiteralPath $script:BASE -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -ieq '.iso' -and ($_.Name -notmatch '\.iso\.zip$') }
+    if ($rootIsos.Count -gt 0) { $groups += 'ROOT' }
+
+    $dirs = Get-TopDirs
+    foreach ($d in $dirs) { $groups += $d.Name }
+
+    foreach ($grp in $groups) {
+        $groupLines = @()
+        if ($grp -eq 'ROOT') {
+            foreach ($f in $rootIsos) { $groupLines += (Convert-PathToRelativeBackslash $f.FullName) }
+        } else {
+            $dirPath = Join-Path $script:BASE $grp
+            if (Test-Path $dirPath) {
+                $files = Get-ChildItem -LiteralPath $dirPath -File -Recurse -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Extension -ieq '.iso' -and ($_.Name -notmatch '\.iso\.zip$') }
+                foreach ($f in $files) { $groupLines += (Convert-PathToRelativeBackslash $f.FullName) }
+            }
+        }
+        if ($groupLines.Count -gt 0) {
+            $groupLines = $groupLines | Sort-Object -CaseSensitive -Unique
+            $linesAll += $groupLines
+            $linesAll += ''
+        }
+    }
+
+    while ($linesAll.Count -gt 0 -and [string]::IsNullOrWhiteSpace($linesAll[-1])) { [void]$linesAll.RemoveAt($linesAll.Count-1) }
+    $script:PROPOSED = ($linesAll -join "`n")
 }
 
-main() {
-  choose_volume
-  normalize_list
-  build_proposed
+# ----------------------------- Diff (git optional) -------------------------
+function Get-GitPath { try { (Get-Command git -ErrorAction Stop).Source } catch { $null } }
 
-  if printf "%s\n" "$PROPOSED" | cmp -s - "$LIST"; then
-    echo "No changes needed. Installed.txt is up to date."
-    exit 0
-  fi
+function Show-GitUnifiedDiff {
+    param([string]$CurrentText, [string]$ProposedText)
+    $git = Get-GitPath
+    if (-not $git) { return $false }
 
-  ask_color_choice
-  show_diff
-  menu_loop
+    $tmp1 = [System.IO.Path]::GetTempFileName()
+    $tmp2 = [System.IO.Path]::GetTempFileName()
+    try {
+        $ct = if ($null -ne $CurrentText) { $CurrentText -replace "\r\n?", "`n" } else { '' }
+        $pt = if ($null -ne $ProposedText) { $ProposedText -replace "\r\n?", "`n" } else { '' }
+        [System.IO.File]::WriteAllText($tmp1, $ct, [System.Text.Encoding]::UTF8)
+        [System.IO.File]::WriteAllText($tmp2, $pt, [System.Text.Encoding]::UTF8)
+        $colorArg = if ($global:UseColor) { '--color=always' } else { '--color=never' }
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName  = $git
+        $psi.ArgumentList.Add('--no-pager'); $psi.ArgumentList.Add('diff'); $psi.ArgumentList.Add('--no-index'); $psi.ArgumentList.Add('--unified=3')
+        $psi.ArgumentList.Add('--label'); $psi.ArgumentList.Add('Installed.txt (current)')
+        $psi.ArgumentList.Add('--label'); $psi.ArgumentList.Add('Installed.txt (proposed)')
+        $psi.ArgumentList.Add($colorArg)
+        $psi.ArgumentList.Add($tmp1); $psi.ArgumentList.Add($tmp2)
+        $psi.RedirectStandardOutput = $true; $psi.UseShellExecute = $false
+        $p = [System.Diagnostics.Process]::Start($psi)
+        $out = $p.StandardOutput.ReadToEnd(); $p.WaitForExit()
+        if (-not [string]::IsNullOrWhiteSpace($out)) { Write-Host $out -NoNewline; return $true }
+        return $false
+    }
+    finally {
+        if (Test-Path $tmp1) { Remove-Item $tmp1 -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $tmp2) { Remove-Item $tmp2 -Force -ErrorAction SilentlyContinue }
+    }
 }
 
-main "$@"
+function Show-Diff {
+    param([string]$CurrentText, [string]$ProposedText)
+    Write-Legend
+    Write-Host ''
+    Write-Host 'Proposed changes to Installed.txt:'
+    if (Show-GitUnifiedDiff -CurrentText $CurrentText -ProposedText $ProposedText) { return }
+
+    $cur = if ([string]::IsNullOrEmpty($CurrentText)) { @() } else { $CurrentText -split "`r?`n" }
+    $pro = if ([string]::IsNullOrEmpty($ProposedText)) { @() } else { $ProposedText -split "`r?`n" }
+    $diff = Compare-Object -ReferenceObject $cur -DifferenceObject $pro -IncludeEqual:$false
+    if (-not $diff) { Write-Host '(no changes)'; return }
+    foreach ($d in $diff) {
+      $prefix = if ($d.SideIndicator -eq '=>') { '+' } else { '-' }
+      Write-DiffLine ("$prefix" + $d.InputObject)
+    }
+}
+
+# ----------------------------- Write with backup ---------------------------
+function Write-Changes {
+    if (Test-Path $script:LIST) {
+        $ts = Get-Date -Format 'yyyyMMdd-HHmmss'
+        Copy-Item -LiteralPath $script:LIST -Destination "$script:LIST.bak.$ts" -Force -ErrorAction SilentlyContinue
+    }
+    $contentToWrite = if ([string]::IsNullOrEmpty($script:PROPOSED)) { '' } else { $script:PROPOSED + "`n" }
+    [System.IO.File]::WriteAllText($script:LIST, $contentToWrite, [System.Text.Encoding]::UTF8)
+
+    $written = [System.IO.File]::ReadAllText($script:LIST)
+    if ($written -eq $contentToWrite) {
+        Write-Host 'Changes written to Installed.txt. Backup saved alongside Installed.txt.'
+    } else {
+        Write-Host 'Warning: write verification failed; Installed.txt does not match proposed content.' -ForegroundColor Yellow
+    }
+}
+
+# ----------------------------- Menu loop ----------------------------------
+function Invoke-Menu {
+    while ($true) {
+        Write-Host ''
+        Write-Host 'Select an option:'
+        Write-Host '  [W] Write these changes to Installed.txt'
+        Write-Host '  [V] View full proposed file'
+        Write-Host '  [R] Rescan disk and re-run dry run'
+        Write-Host '  [Q] Quit without writing'
+        $choice = Read-Host 'Your choice (W/V/R/Q)'
+        switch -Regex ($choice) {
+            '^[Ww]$' { Write-Changes; break }
+            '^[Vv]$' { Write-Host '----- Proposed Installed.txt -----'; Write-Host $script:PROPOSED; Write-Host '----------------------------------' }
+            '^[Rr]$' { Build-Proposed; Show-Diff -CurrentText (Get-Content -LiteralPath $script:LIST -Raw) -ProposedText $script:PROPOSED }
+            '^[Qq]$' { Write-Host 'Aborted. No changes written.'; break }
+            default  { Write-Host 'Unrecognized choice.' }
+        }
+    }
+}
+
+# ----------------------------- Main ---------------------------------------
+try {
+    $script:BASE = Select-Drive
+    Set-ListFile
+    Build-Proposed
+
+    $current = Get-Content -LiteralPath $script:LIST -Raw
+    if ($current -eq ($script:PROPOSED)) { Write-Host 'No changes needed. Installed.txt is up to date.'; return }
+
+    Read-ColorPreference
+    Show-Diff -CurrentText $current -ProposedText $script:PROPOSED
+    Invoke-Menu
+}
+catch {
+    Write-Host ("Error: {0}" -f $_.Exception.Message) -ForegroundColor Red
+    exit 1
+}
